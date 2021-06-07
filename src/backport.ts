@@ -55,33 +55,10 @@ const getBackportBaseToHead = ({
   return baseToHead;
 };
 
-const warnIfSquashIsNotTheOnlyAllowedMergeMethod = async ({
-  github,
-  owner,
-  repo,
-}: {
-  github: InstanceType<typeof GitHub>;
-  owner: string;
-  repo: string;
-}) => {
-  const {
-    data: { allow_merge_commit, allow_rebase_merge },
-  } = await github.repos.get({ owner, repo });
-  if (allow_merge_commit || allow_rebase_merge) {
-    warning(
-      [
-        "Your repository allows merge commits and rebase merging.",
-        " However, Backport only supports rebased and merged pull requests with a single commit and squashed and merged pull requests.",
-        " Consider only allowing squash merging.",
-        " See https://help.github.com/en/github/administering-a-repository/about-merge-methods-on-github for more information.",
-      ].join("\n"),
-    );
-  }
-};
-
 const backportOnce = async ({
   base,
   body,
+  commits,
   commitToBackport,
   github,
   head,
@@ -89,9 +66,11 @@ const backportOnce = async ({
   owner,
   repo,
   title,
+  pullRequestNumber
 }: {
   base: string;
   body: string;
+  commits: string[];
   commitToBackport: string;
   github: InstanceType<typeof GitHub>;
   head: string;
@@ -99,23 +78,43 @@ const backportOnce = async ({
   owner: string;
   repo: string;
   title: string;
+  pullRequestNumber: number;
 }) => {
   const git = async (...args: string[]) => {
     await exec("git", args, { cwd: repo });
   };
 
+  let backportError = null;
+  await git("fetch", "origin", `pull/${pullRequestNumber}/head`);
   await git("switch", base);
   await git("switch", "--create", head);
+
   try {
-    await git("cherry-pick", commitToBackport);
+    await git("show", commitToBackport + "^2");
+    // We have a merge commit
+    try {
+      await git("cherry-pick", `${commitToBackport}^..${commitToBackport}^2`);
+    } catch (error: unknown) {
+      await git("cherry-pick", "--abort");
+      backportError = error;
+    }
   } catch (error: unknown) {
-    await git("cherry-pick", "--abort");
-    throw error;
+    // No merge commit
+    try {
+      await git("cherry-pick", ...commits);
+    } catch (error: unknown) {
+      await git("cherry-pick", "--abort");
+      backportError = error;
+    }
+  }
+
+  if (backportError) {
+    throw backportError;
   }
 
   await git("push", "--set-upstream", "origin", head);
   const {
-    data: { number: pullRequestNumber },
+    data: { number: backportPullRequestNumber },
   } = await github.pulls.create({
     base,
     body,
@@ -126,7 +125,7 @@ const backportOnce = async ({
   });
   if (labelsToAdd.length > 0) {
     await github.issues.addLabels({
-      issue_number: pullRequestNumber,
+      issue_number: backportPullRequestNumber,
       labels: labelsToAdd,
       owner,
       repo,
@@ -136,12 +135,12 @@ const backportOnce = async ({
 
 const getFailedBackportCommentBody = ({
   base,
-  commitToBackport,
+  commits,
   errorMessage,
   head,
 }: {
   base: string;
-  commitToBackport: string;
+  commits: string[];
   errorMessage: string;
   head: string;
 }) => {
@@ -162,7 +161,7 @@ const getFailedBackportCommentBody = ({
     "# Create a new branch",
     `git switch --create ${head}`,
     "# Cherry-pick the merged commit of this pull request and resolve the conflicts",
-    `git cherry-pick --mainline 1 ${commitToBackport}`,
+    `git cherry-pick ${commits}`,
     "# Push it to GitHub",
     `git push --set-upstream origin ${head}`,
     "# Go back to the original working tree",
@@ -185,6 +184,7 @@ const backport = async ({
       merged,
       number: pullRequestNumber,
       title: originalTitle,
+      user: { login: pullRequestUser },
     },
     repository: {
       name: repo,
@@ -217,11 +217,21 @@ const backport = async ({
 
   const github = getOctokit(token);
 
-  await warnIfSquashIsNotTheOnlyAllowedMergeMethod({ github, owner, repo });
+  const commitsResponse = await github.request(
+    "GET /repos/{owner}/{repo}/pulls/{pull_number}/commits",
+    {
+      owner: owner,
+      repo: repo,
+      pull_number: pullRequestNumber,
+    },
+  );
 
-  // The merge commit SHA is actually not null.
+  // The commit range (interesting for rebase merges)
+  const commits = commitsResponse.data.map(({ sha }) => sha);
+
+  // The merge commit itself (only interesting if it's a merge)
   const commitToBackport = String(mergeCommitSha);
-  info(`Backporting ${commitToBackport} from #${pullRequestNumber}`);
+  info(`Backporting #${pullRequestNumber}`);
 
   await exec("git", [
     "clone",
@@ -236,7 +246,7 @@ const backport = async ({
   await exec("git", ["config", "--global", "user.name", "github-actions[bot]"]);
 
   for (const [base, head] of Object.entries(backportBaseToHead)) {
-    const body = `Backport ${commitToBackport} from #${pullRequestNumber}`;
+    const body = `Backport #${pullRequestNumber}\n **Authored by:** @${pullRequestUser}`;
 
     let title = titleTemplate;
     Object.entries({
@@ -254,6 +264,7 @@ const backport = async ({
         await backportOnce({
           base,
           body,
+          commits,
           commitToBackport,
           github,
           head,
@@ -261,6 +272,7 @@ const backport = async ({
           owner,
           repo,
           title,
+          pullRequestNumber
         });
       } catch (error: unknown) {
         if (!(error instanceof Error)) {
@@ -273,7 +285,7 @@ const backport = async ({
         await github.issues.createComment({
           body: getFailedBackportCommentBody({
             base,
-            commitToBackport,
+            commits,
             errorMessage: error.message,
             head,
           }),
